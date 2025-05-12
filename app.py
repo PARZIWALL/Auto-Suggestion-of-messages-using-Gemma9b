@@ -1,16 +1,3 @@
-from flask import Flask, request, jsonify
-import uuid
-import os
-from dotenv import load_dotenv
-from groq import Groq  # Assuming groq.com provides a Python client
-import json
-import random
-import db
-import sqlite3
-
-
-load_dotenv("py.env")
-
 from flask import Flask, request, jsonify, render_template
 import uuid
 import os
@@ -19,6 +6,8 @@ from groq import Groq  # Assuming groq.com provides a Python client
 import json
 import random
 import db
+import sqlite3
+from db import DB_FILE
 
 load_dotenv("py.env")
 
@@ -173,6 +162,30 @@ def extract_category_and_template_flag(intent_response):
         print("JSON parse error:", intent_response)
         return None, None
 
+
+
+def generate_text(context,message):
+    chat_completion = client.chat.completions.create(
+        messages=[
+            {
+                "role": "system",
+                "content": (
+                   "You are a helpful assistant. Given a user's message, respond briefly and naturally, like in a real-time chat. "
+                    "Keep it concise, friendly, and context-aware. Use no more than a few sentences. the context of the chat will be given to you. "
+                    "Do NOT add explanations or metadata — only reply to the message. only reply to the message. "
+                    "context: {context} "
+                    
+                )
+            },
+            {
+                "role": "user",
+                "content": message,
+            }
+        ],
+        model="gemma2-9b-it",
+    )
+    print(chat_completion.choices[0].message.content.strip())
+    return chat_completion.choices[0].message.content.strip()
 def generate_template_response(intent):
     response = template_responses.get(intent, ["I'm here to help!"])
     return random.choice(response)
@@ -205,18 +218,34 @@ def start_chat():
     chat_sessions[user_id] = []
     return jsonify({"user_id": user_id})
 
+import sqlite3
+
+def sender_exists(sender_id):
+    connection = sqlite3.connect(db.DB_FILE)
+    cursor = connection.cursor()
+    cursor.execute('SELECT 1 FROM chats WHERE sender = ? OR receiver = ? LIMIT 1', (sender_id, sender_id))
+    exists = cursor.fetchone() is not None
+    connection.close()
+    return exists
+
 @app.route('/send_message', methods=['POST'])
 def send_message():
     data = request.get_json()
     sender_id = data.get("user_id")
     receiver_id = data.get("receiver_id")
     message = data.get("message")
+    
+    
 
     if not sender_id or not receiver_id or not message:
         return jsonify({"error": "Missing sender_id, receiver_id, or message"}), 400
 
-    if sender_id not in chat_sessions:
+    if not sender_exists(sender_id):
         return jsonify({"error": "Invalid sender ID"}), 400
+    
+    if "@autogenerate" in message:
+            message = autogenerate(message, sender_id, receiver_id)
+            print(message)
 
     intent, method = classify_intent(message)
 
@@ -235,15 +264,13 @@ def send_message():
         "suggestion": suggestion
     }
 
-    chat_sessions[sender_id].append(message_entry)
-    if receiver_id not in chat_sessions:
-        chat_sessions[receiver_id] = []
-    chat_sessions[receiver_id].append(message_entry)
+    # Store message in database (chat_messages)
+    db.insert_message(sender=sender_id, receiver=receiver_id, message=message)
 
-    db.insert_message(sender=sender_id, receiver=receiver_id, message=message, suggestion=suggestion)
+    # Store suggestion in database (suggestions)
+    db.insert_suggestion(user_id=sender_id, other_user_id=receiver_id, suggestion=suggestion)
 
     return jsonify({"suggestion": suggestion})
-
 
 @app.route('/get_chat_history', methods=['GET'])
 def get_chat_history():
@@ -253,59 +280,62 @@ def get_chat_history():
     if not user_id or not other_user_id:
         return jsonify({"error": "Missing user_id or other_user_id"}), 400
 
-    # Fetch the conversation from the DB (last 20 messages)
+    # Fetch conversation (only messages)
     conversation = db.fetch_conversation(user_id, other_user_id)
 
-    # If conversation is empty, return an empty response
     if not conversation:
         return jsonify({"error": "No conversation found"}), 400
 
-    # Reverse the conversation to get messages in ascending order
-    conversation = conversation[::-1]
-
-    # Prepare the response format
     chat_history = []
-
-    # Extract the suggestion from the most recent message (last message after reversal)
-    latest_suggestion = None
-    latest_message = conversation[-1]  # The latest message is now the last element after reversal
-
-    sender, receiver, message, timestamp = latest_message
-    suggestion = None
-
-    # Check if there is a suggestion attached to the latest message
-    connection = sqlite3.connect(DB_FILE)
-    cursor = connection.cursor()
-
-    cursor.execute('''
-        SELECT suggestion FROM chat_history
-        WHERE sender = ? AND receiver = ? AND message = ? AND timestamp = ?
-    ''', (sender, receiver, message, timestamp))
-
-    result = cursor.fetchone()
-    if result and result[0]:
-        latest_suggestion = result[0]
-
-    # Close the database connection
-    connection.close()
-
-    # Add all the messages (oldest to newest) along with the suggestion key
-    for msg in conversation:
-        sender, receiver, message, timestamp = msg
-        entry = {
+    for sender, receiver, message, timestamp in conversation:
+        chat_history.append({
             "sender": sender,
             "receiver": receiver,
             "message": message,
             "timestamp": timestamp
-        }
-        chat_history.append(entry)
+        })
 
-    # Include the latest suggestion in the response
-    response = {
+    # Fetch the latest suggestion independently
+    latest_suggestion = db.fetch_latest_suggestion(user_id, other_user_id)
+
+    # Final response
+    return jsonify({
         "chat_history": chat_history,
-        "latest_suggestion": latest_suggestion
-    }
+        "latest_suggestion": latest_suggestion['suggestion'] if latest_suggestion else None
+    })
 
-    return jsonify(response)
+@app.route('/get_latest_suggestion', methods=['GET'])
+def get_latest_suggestion():
+    user_id = request.args.get("user_id")
+    other_user_id = request.args.get("other_user_id")
+
+    if not user_id or not other_user_id:
+        return jsonify({"error": "Missing user_id or other_user_id"}), 400
+
+    latest_suggestion = db.fetch_latest_suggestion(user_id, other_user_id)
+
+    if not latest_suggestion:
+        return jsonify({"error": "No suggestion found"}), 404
+
+    return jsonify({"latest_suggestion": latest_suggestion['suggestion']})
+
+
+
+
+def autogenerate(message, user_id, other_user_id):
+    
+
+    context = db.fetch(user_id, other_user_id)
+    if(context is None):
+        return jsonify({"error": "No context found"}), 200
+    generated_text= generate_text(message=message, context=context)
+
+    if generated_text is None :
+        return jsonify({"error": "Unable to classify intent or method"}), 400
+
+    
+
+    return generated_text
 if __name__ == '__main__':
     app.run(debug=True, host='0.0.0.0', port=5000)
+   
